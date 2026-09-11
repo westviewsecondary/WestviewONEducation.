@@ -1,0 +1,1351 @@
+-- OneEducation MIS database
+-- Run this entire file once in Supabase SQL Editor.
+-- Designed for the flat-file OneEducation GitHub build.
+
+create extension if not exists pgcrypto;
+
+-- ---------- Core identity / permissions ----------
+create table if not exists public.profiles (
+  id uuid primary key references auth.users(id) on delete cascade,
+  email text unique not null,
+  full_name text,
+  role text not null default 'teacher' check (role in ('admin','teacher','exam_officer','pastoral','cover_manager')),
+  created_at timestamptz not null default now()
+);
+
+create or replace function public.handle_new_user()
+returns trigger language plpgsql security definer set search_path=public as $$
+begin
+  insert into public.profiles(id,email,full_name,role)
+  values(
+    new.id,
+    coalesce(new.email,''),
+    coalesce(new.raw_user_meta_data->>'full_name', split_part(coalesce(new.email,''),'@',1)),
+    case when lower(coalesce(new.email,''))='masonsandersbussiness@gmail.com' then 'admin' else 'teacher' end
+  )
+  on conflict (id) do update set email=excluded.email;
+  return new;
+end $$;
+
+drop trigger if exists on_auth_user_created on auth.users;
+create trigger on_auth_user_created after insert or update of email on auth.users
+for each row execute procedure public.handle_new_user();
+
+create or replace function public.staff_role()
+returns text language sql stable security definer set search_path=public as $$
+  select role from public.profiles where id=auth.uid()
+$$;
+
+create or replace function public.is_staff()
+returns boolean language sql stable security definer set search_path=public as $$
+  select exists(select 1 from public.profiles where id=auth.uid())
+$$;
+
+create or replace function public.is_admin()
+returns boolean language sql stable security definer set search_path=public as $$
+  select exists(select 1 from public.profiles where id=auth.uid() and role='admin')
+$$;
+
+-- ---------- School structure ----------
+create table if not exists public.school_settings (
+  id int primary key default 1 check (id=1),
+  school_name text not null default 'OneEducation Academy',
+  school_status text not null default 'open' check (school_status in ('open','closing','closed')),
+  updated_at timestamptz not null default now(),
+  updated_by uuid references auth.users(id)
+);
+insert into public.school_settings(id) values(1) on conflict do nothing;
+
+create table if not exists public.houses (
+  id uuid primary key default gen_random_uuid(),
+  name text unique not null,
+  sort_order int not null default 0
+);
+
+create table if not exists public.tutor_groups (
+  id uuid primary key default gen_random_uuid(),
+  code text unique not null,
+  year_group int not null check (year_group between 7 and 11),
+  tutor_name text,
+  room text,
+  description text,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.subjects (
+  id uuid primary key default gen_random_uuid(),
+  name text unique not null,
+  code text unique not null,
+  category text not null default 'gcse' check (category in ('core','gcse','other')),
+  active boolean not null default true
+);
+
+create table if not exists public.rooms (
+  id uuid primary key default gen_random_uuid(),
+  code text unique not null,
+  name text not null,
+  building text not null,
+  capacity int not null default 30,
+  type text not null default 'Classroom',
+  active boolean not null default true
+);
+
+create table if not exists public.students (
+  id uuid primary key default gen_random_uuid(),
+  first_name text not null,
+  last_name text not null,
+  year_group int not null check (year_group between 7 and 11),
+  tutor_group_id uuid references public.tutor_groups(id) on delete set null,
+  house_id uuid references public.houses(id) on delete set null,
+  candidate_number text unique not null,
+  portal_code_hash text unique not null,
+  status text not null default 'active' check (status in ('active','left','suspended')),
+  created_at timestamptz not null default now()
+);
+create index if not exists students_name_idx on public.students(last_name,first_name);
+create index if not exists students_tutor_idx on public.students(tutor_group_id);
+
+create table if not exists public.class_groups (
+  id uuid primary key default gen_random_uuid(),
+  display_name text unique not null,
+  subject text not null,
+  subject_code text not null,
+  subject_type text not null default 'gcse' check(subject_type in ('core','gcse','other')),
+  year_group int not null check(year_group between 7 and 11),
+  set_number int not null default 1,
+  room_code text,
+  teacher_name text,
+  student_count int not null default 0,
+  created_at timestamptz not null default now(),
+  unique(year_group,subject,set_number)
+);
+
+create table if not exists public.class_memberships (
+  student_id uuid not null references public.students(id) on delete cascade,
+  class_group_id uuid not null references public.class_groups(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  primary key(student_id,class_group_id)
+);
+
+create table if not exists public.student_timetable (
+  id uuid primary key default gen_random_uuid(),
+  student_id uuid not null references public.students(id) on delete cascade,
+  day_of_week int not null check(day_of_week between 1 and 5),
+  period int not null check(period between 1 and 5),
+  class_id uuid references public.class_groups(id) on delete set null,
+  class_name text,
+  subject text,
+  room_code text,
+  unique(student_id,day_of_week,period)
+);
+
+-- ---------- Attendance ----------
+create table if not exists public.attendance_marks (
+  id uuid primary key default gen_random_uuid(),
+  student_id uuid not null references public.students(id) on delete cascade,
+  class_id uuid not null references public.class_groups(id) on delete cascade,
+  attendance_date date not null,
+  period int not null check(period between 1 and 5),
+  mark text not null check(mark in ('present','absent','late')),
+  reason text,
+  notes text,
+  recorded_by uuid references auth.users(id),
+  recorded_at timestamptz not null default now(),
+  unique(student_id,class_id,attendance_date,period)
+);
+
+-- ---------- Behaviour / rewards ----------
+create table if not exists public.behaviour_reasons (
+  id uuid primary key default gen_random_uuid(),
+  name text unique not null,
+  points int not null check(points >= 0),
+  active boolean not null default true
+);
+
+create table if not exists public.behaviour_events (
+  id uuid primary key default gen_random_uuid(),
+  student_id uuid not null references public.students(id) on delete cascade,
+  reason_id uuid references public.behaviour_reasons(id),
+  reason text not null,
+  points int not null default 0,
+  period int check(period between 1 and 5),
+  notes text,
+  removal boolean not null default false,
+  recorded_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.lesson_restrictions (
+  id uuid primary key default gen_random_uuid(),
+  student_id uuid not null references public.students(id) on delete cascade,
+  restriction_date date not null default current_date,
+  period int not null check(period between 1 and 5),
+  label text not null default 'Scheduled to be out of lesson',
+  source_behaviour_event uuid references public.behaviour_events(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  unique(student_id,restriction_date,period)
+);
+
+create table if not exists public.house_points (
+  id uuid primary key default gen_random_uuid(),
+  student_id uuid not null references public.students(id) on delete cascade,
+  points int not null check(points > 0),
+  reason text not null,
+  recorded_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+-- ---------- Communities ----------
+create table if not exists public.communities (
+  id uuid primary key default gen_random_uuid(),
+  type text not null check(type in ('tutor','class')),
+  ref_id uuid not null,
+  name text not null,
+  created_at timestamptz not null default now(),
+  unique(type,ref_id)
+);
+
+create table if not exists public.community_posts (
+  id uuid primary key default gen_random_uuid(),
+  community_id uuid not null references public.communities(id) on delete cascade,
+  title text not null default 'Announcement',
+  body text not null,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+-- ---------- Emergencies ----------
+create table if not exists public.emergency_alerts (
+  id uuid primary key default gen_random_uuid(),
+  student_id uuid references public.students(id) on delete cascade,
+  type text not null,
+  severity text not null default 'medium' check(severity in ('low','medium','high')),
+  status text not null default 'open' check(status in ('open','monitoring','resolved')),
+  details text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  resolved_at timestamptz
+);
+
+-- ---------- Exams ----------
+create table if not exists public.exam_windows (
+  id uuid primary key default gen_random_uuid(),
+  start_date date not null,
+  end_date date not null,
+  exam_type text not null check(exam_type in ('Mock 1','Mock 2','Mock 3','GCSE')),
+  year_group int not null check(year_group between 10 and 11),
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now(),
+  check(end_date >= start_date),
+  check(not (exam_type='Mock 1' and year_group<>10))
+);
+
+create table if not exists public.exams (
+  id uuid primary key default gen_random_uuid(),
+  exam_window_id uuid references public.exam_windows(id) on delete cascade,
+  exam_type text not null check(exam_type in ('Mock 1','Mock 2','Mock 3','GCSE')),
+  subject text not null,
+  paper text not null,
+  exam_date date not null,
+  start_time time not null,
+  duration_minutes int not null default 90 check(duration_minutes > 0),
+  board text,
+  room_code text default 'HALL',
+  official boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+create table if not exists public.exam_class_links (
+  exam_id uuid not null references public.exams(id) on delete cascade,
+  class_id uuid not null references public.class_groups(id) on delete cascade,
+  primary key(exam_id,class_id)
+);
+
+-- ---------- Cover ----------
+create table if not exists public.cover_arrangements (
+  id uuid primary key default gen_random_uuid(),
+  date date not null,
+  period int not null check(period between 1 and 5),
+  class_id uuid references public.class_groups(id) on delete set null,
+  class_name text,
+  absent_teacher text not null,
+  cover_teacher text,
+  room_code text,
+  status text not null default 'Open' check(status in ('Open','Assigned','Completed','Cancelled')),
+  notes text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+-- ---------- Calendar ----------
+create table if not exists public.calendar_events (
+  id uuid primary key default gen_random_uuid(),
+  title text not null,
+  event_date date not null,
+  end_date date,
+  category text not null default 'school',
+  details text,
+  created_by uuid references auth.users(id),
+  created_at timestamptz not null default now()
+);
+
+-- ---------- Helpers ----------
+create or replace function public.sync_class_counts()
+returns trigger language plpgsql security definer set search_path=public as $$
+begin
+  update public.class_groups cg
+  set student_count=(select count(*) from public.class_memberships cm where cm.class_group_id=cg.id)
+  where cg.id=coalesce(new.class_group_id,old.class_group_id);
+  return coalesce(new,old);
+end $$;
+drop trigger if exists class_membership_count_trg on public.class_memberships;
+create trigger class_membership_count_trg after insert or delete on public.class_memberships
+for each row execute function public.sync_class_counts();
+
+create or replace function public.make_portal_code()
+returns text language sql volatile as $$
+  select 'OE-' || upper(substr(encode(gen_random_bytes(6),'hex'),1,4)) || '-' ||
+         upper(substr(encode(gen_random_bytes(6),'hex'),1,4))
+$$;
+
+create or replace function public.make_candidate_number()
+returns text language plpgsql volatile as $$
+declare n text;
+begin
+  loop
+    n := lpad((1000 + floor(random()*9000))::int::text,4,'0');
+    exit when not exists(select 1 from public.students where candidate_number=n);
+  end loop;
+  return n;
+end $$;
+
+create or replace function public.generate_student_timetable(p_student_id uuid)
+returns void language plpgsql security definer set search_path=public as $$
+declare
+  classes uuid[];
+  c uuid;
+  d int;
+  p int;
+  info record;
+begin
+  delete from public.student_timetable where student_id=p_student_id;
+  select array_agg(class_group_id order by random()) into classes
+  from public.class_memberships where student_id=p_student_id;
+  if classes is null or array_length(classes,1)=0 then return; end if;
+
+  for d in 1..5 loop
+    for p in 1..5 loop
+      c := classes[1 + floor(random()*array_length(classes,1))::int];
+      select display_name,subject,room_code into info from public.class_groups where id=c;
+      insert into public.student_timetable(student_id,day_of_week,period,class_id,class_name,subject,room_code)
+      values(p_student_id,d,p,c,info.display_name,info.subject,info.room_code);
+    end loop;
+  end loop;
+end $$;
+
+create or replace function public.import_student(
+  p_first_name text,
+  p_last_name text,
+  p_year_group int,
+  p_tutor_group_id uuid
+) returns table(
+  student_id uuid,
+  full_name text,
+  portal_code text,
+  candidate_number text,
+  house_name text,
+  tutor_code text
+) language plpgsql security definer set search_path=public as $$
+declare
+  v_student uuid;
+  v_code text;
+  v_candidate text;
+  v_house uuid;
+  v_house_name text;
+  v_tutor_code text;
+  r record;
+begin
+  if not public.is_staff() then raise exception 'Staff login required'; end if;
+  if p_year_group not between 7 and 11 then raise exception 'Invalid year group'; end if;
+  select code into v_tutor_code from public.tutor_groups where id=p_tutor_group_id and year_group=p_year_group;
+  if v_tutor_code is null then raise exception 'Tutor group does not belong to Year %', p_year_group; end if;
+
+  select h.id,h.name into v_house,v_house_name from public.houses h order by random() limit 1;
+  if v_house is null then raise exception 'No houses configured'; end if;
+
+  loop
+    v_code := public.make_portal_code();
+    exit when not exists(select 1 from public.students where portal_code_hash=encode(digest(v_code,'sha256'),'hex'));
+  end loop;
+  v_candidate := public.make_candidate_number();
+
+  insert into public.students(first_name,last_name,year_group,tutor_group_id,house_id,candidate_number,portal_code_hash)
+  values(trim(p_first_name),trim(p_last_name),p_year_group,p_tutor_group_id,v_house,v_candidate,encode(digest(v_code,'sha256'),'hex'))
+  returning id into v_student;
+
+  -- One class per core subject.
+  for r in
+    select distinct on(subject) id
+    from public.class_groups
+    where year_group=p_year_group and subject_type='core'
+    order by subject,random()
+  loop
+    insert into public.class_memberships(student_id,class_group_id) values(v_student,r.id) on conflict do nothing;
+  end loop;
+
+  -- Four different GCSE option subjects where available.
+  for r in
+    select id from (
+      select distinct on(subject) id,subject
+      from public.class_groups
+      where year_group=p_year_group and subject_type='gcse'
+      order by subject,random()
+    ) q order by random() limit 4
+  loop
+    insert into public.class_memberships(student_id,class_group_id) values(v_student,r.id) on conflict do nothing;
+  end loop;
+
+  perform public.generate_student_timetable(v_student);
+
+  -- Ensure tutor/class communities exist.
+  insert into public.communities(type,ref_id,name)
+  values('tutor',p_tutor_group_id,v_tutor_code || ' Community') on conflict(type,ref_id) do nothing;
+  insert into public.communities(type,ref_id,name)
+  select 'class',cg.id,cg.display_name from public.class_groups cg
+  join public.class_memberships cm on cm.class_group_id=cg.id
+  where cm.student_id=v_student
+  on conflict(type,ref_id) do nothing;
+
+  return query select v_student,trim(p_first_name)||' '||trim(p_last_name),v_code,v_candidate,v_house_name,v_tutor_code;
+end $$;
+
+create or replace function public.get_class_register(p_class_id uuid,p_date date,p_period int)
+returns table(
+  student_id uuid,first_name text,last_name text,tutor_code text,
+  existing_mark text,existing_reason text,existing_notes text
+) language sql security definer set search_path=public as $$
+  select s.id,s.first_name,s.last_name,tg.code,am.mark,am.reason,am.notes
+  from public.class_memberships cm
+  join public.students s on s.id=cm.student_id
+  left join public.tutor_groups tg on tg.id=s.tutor_group_id
+  left join public.attendance_marks am on am.student_id=s.id and am.class_id=p_class_id
+    and am.attendance_date=p_date and am.period=p_period
+  where cm.class_group_id=p_class_id and s.status='active'
+  and public.is_staff()
+  order by s.last_name,s.first_name
+$$;
+
+create or replace function public.record_attendance_mark(
+  p_student_id uuid,p_class_id uuid,p_attendance_date date,p_period int,
+  p_mark text,p_reason text default null,p_notes text default null
+) returns void language plpgsql security definer set search_path=public as $$
+declare v_status text;
+begin
+  if not public.is_staff() then raise exception 'Staff login required'; end if;
+  select school_status into v_status from public.school_settings where id=1;
+  if v_status <> 'open' then raise exception 'Attendance is locked because school status is %', v_status; end if;
+  if p_mark not in ('present','absent','late') then raise exception 'Invalid attendance mark'; end if;
+
+  insert into public.attendance_marks(student_id,class_id,attendance_date,period,mark,reason,notes,recorded_by)
+  values(p_student_id,p_class_id,p_attendance_date,p_period,p_mark,p_reason,p_notes,auth.uid())
+  on conflict(student_id,class_id,attendance_date,period) do update
+  set mark=excluded.mark,reason=excluded.reason,notes=excluded.notes,recorded_by=auth.uid(),recorded_at=now();
+end $$;
+
+create or replace function public.record_behaviour(
+  p_student_id uuid,p_reason_id uuid,p_period int,p_notes text default null,p_removal boolean default false
+) returns uuid language plpgsql security definer set search_path=public as $$
+declare r record; v_event uuid;
+begin
+  if not public.is_staff() then raise exception 'Staff login required'; end if;
+  select name,points into r from public.behaviour_reasons where id=p_reason_id and active=true;
+  if r.name is null then raise exception 'Behaviour reason not found'; end if;
+
+  insert into public.behaviour_events(student_id,reason_id,reason,points,period,notes,removal,recorded_by)
+  values(p_student_id,p_reason_id,r.name,r.points,p_period,p_notes,p_removal,auth.uid())
+  returning id into v_event;
+
+  -- Removal: schedule next lesson only for P1-P3.
+  -- P4 must NOT create P5 restriction because lunch (13:20-14:00) breaks the sequence.
+  if p_removal and p_period between 1 and 3 then
+    insert into public.lesson_restrictions(student_id,restriction_date,period,label,source_behaviour_event)
+    values(p_student_id,current_date,p_period+1,'Scheduled to be out of lesson',v_event)
+    on conflict(student_id,restriction_date,period) do update
+    set label=excluded.label,source_behaviour_event=excluded.source_behaviour_event;
+  end if;
+  return v_event;
+end $$;
+
+create or replace function public.set_school_status(p_status text)
+returns void language plpgsql security definer set search_path=public as $$
+begin
+  if not public.is_admin() then raise exception 'Administrator access required'; end if;
+  if p_status not in ('open','closing','closed') then raise exception 'Invalid school status'; end if;
+  update public.school_settings set school_status=p_status,updated_at=now(),updated_by=auth.uid() where id=1;
+end $$;
+
+create or replace function public.create_class_batch(
+  p_year_group int,p_set_count int,p_mode text,p_single_subject text default null
+) returns int language plpgsql security definer set search_path=public as $$
+declare s record; n int; v_count int; v_suffix text; made int:=0;
+begin
+  if not public.is_staff() then raise exception 'Staff login required'; end if;
+  if p_year_group not between 7 and 11 then raise exception 'Invalid year group'; end if;
+  if p_set_count not between 1 and 10 then raise exception 'Set count must be 1-10'; end if;
+
+  for s in
+    select * from public.subjects
+    where active=true and (
+      p_mode='all' or
+      (p_mode='core' and category='core') or
+      (p_mode='gcse' and category='gcse') or
+      (p_mode='single' and name=p_single_subject)
+    )
+    order by category,name
+  loop
+    v_count := case when s.category='core' then p_set_count when s.name in ('History','Geography') then 2 else 1 end;
+    for n in 1..v_count loop
+      v_suffix := case when s.category<>'core' and s.name in ('History','Geography') then case when n=1 then 'A' else 'B' end else n::text end;
+      insert into public.class_groups(display_name,subject,subject_code,subject_type,year_group,set_number,room_code)
+      values(
+        p_year_group::text||s.code||v_suffix||' '||s.name,
+        s.name,s.code,s.category,p_year_group,n,
+        case
+          when s.name in ('English','History','Geography') then 'A'||lpad((((n*3)%6)+1)::text,2,'0')
+          when s.name='Mathematics' then 'B'||lpad((((n*3)%6)+1)::text,2,'0')
+          when s.name in ('Combined Science','Biology','Chemistry','Physics') then 'C'||lpad((((n*3)%6)+1)::text,2,'0')
+          when s.name in ('French','German','Spanish') then 'D'||lpad((((n*3)%6)+1)::text,2,'0')
+          when s.name in ('Art & Design','3D Design','Music','Drama') then 'E'||lpad((((n*3)%6)+1)::text,2,'0')
+          when s.name in ('Food Preparation & Nutrition','Design & Technology') then 'F'||lpad((((n*3)%6)+1)::text,2,'0')
+          when s.name in ('Computer Science','Business','Film Studies') then 'G'||lpad((((n*3)%6)+1)::text,2,'0')
+          when s.name='GCSE PE' then 'P01-GYM'
+          else 'H'||lpad((((n*3)%6)+1)::text,2,'0')
+        end
+      ) on conflict(year_group,subject,set_number) do nothing;
+      if found then made:=made+1; end if;
+    end loop;
+  end loop;
+
+  insert into public.communities(type,ref_id,name)
+  select 'class',id,display_name from public.class_groups where year_group=p_year_group
+  on conflict(type,ref_id) do nothing;
+  return made;
+end $$;
+
+create or replace function public.create_exam_window_and_schedule(
+  p_start_date date,p_end_date date,p_exam_type text,p_year_group int
+) returns uuid language plpgsql security definer set search_path=public as $$
+declare w uuid; s record; i int:=0; exam_id uuid; exam_day date; slot time;
+begin
+  if not public.is_staff() then raise exception 'Staff login required'; end if;
+  if p_exam_type='Mock 1' and p_year_group<>10 then raise exception 'Mock 1 is Year 10 only'; end if;
+  if p_exam_type not in ('Mock 1','Mock 2','Mock 3','GCSE') then raise exception 'Invalid exam type'; end if;
+  if p_end_date<p_start_date then raise exception 'End date is before start date'; end if;
+
+  insert into public.exam_windows(start_date,end_date,exam_type,year_group,created_by)
+  values(p_start_date,p_end_date,p_exam_type,p_year_group,auth.uid()) returning id into w;
+
+  -- GCSE dates are imported from an official CSV, not auto-generated.
+  if p_exam_type='GCSE' then return w; end if;
+
+  for s in
+    select distinct subject from public.class_groups where year_group=p_year_group order by subject
+  loop
+    exam_day := p_start_date + ((i/2) % greatest(1,(p_end_date-p_start_date+1)))::int;
+    slot := case when i%2=0 then time '09:00' else time '13:30' end;
+    insert into public.exams(exam_window_id,exam_type,subject,paper,exam_date,start_time,duration_minutes,room_code,official)
+    values(w,p_exam_type,s.subject,s.subject||' '||p_exam_type,exam_day,slot,90,'HALL',false)
+    returning id into exam_id;
+
+    insert into public.exam_class_links(exam_id,class_id)
+    select exam_id,id from public.class_groups where year_group=p_year_group and subject=s.subject;
+
+    insert into public.community_posts(community_id,title,body,created_by)
+    select c.id,p_exam_type||' exam published',
+      s.subject||' exam: '||to_char(exam_day,'Dy DD Mon YYYY')||' at '||to_char(slot,'HH24:MI'),
+      auth.uid()
+    from public.communities c
+    join public.class_groups cg on c.type='class' and c.ref_id=cg.id
+    where cg.year_group=p_year_group and cg.subject=s.subject;
+    i:=i+1;
+  end loop;
+  return w;
+end $$;
+
+create or replace function public.import_official_gcse_exam(
+  p_subject text,p_paper text,p_exam_date date,p_start_time time,p_duration_minutes int,p_board text default null
+) returns uuid language plpgsql security definer set search_path=public as $$
+declare w uuid; e uuid;
+begin
+  if public.staff_role() not in ('admin','exam_officer') then raise exception 'Admin or Exam Officer access required'; end if;
+  select id into w from public.exam_windows
+  where exam_type='GCSE' and year_group=11 and p_exam_date between start_date and end_date
+  order by start_date desc limit 1;
+  if w is null then raise exception 'Create a Year 11 GCSE exam window covering % first',p_exam_date; end if;
+  if not exists(select 1 from public.subjects where lower(name)=lower(trim(p_subject))) then
+    raise exception 'Unknown subject: %',p_subject;
+  end if;
+
+  insert into public.exams(exam_window_id,exam_type,subject,paper,exam_date,start_time,duration_minutes,board,room_code,official)
+  values(w,'GCSE',trim(p_subject),trim(p_paper),p_exam_date,p_start_time,p_duration_minutes,p_board,'HALL',true)
+  returning id into e;
+
+  insert into public.exam_class_links(exam_id,class_id)
+  select e,id from public.class_groups where year_group=11 and lower(subject)=lower(trim(p_subject));
+
+  insert into public.community_posts(community_id,title,body,created_by)
+  select c.id,'Official GCSE exam',
+    trim(p_paper)||': '||to_char(p_exam_date,'Dy DD Mon YYYY')||' at '||to_char(p_start_time,'HH24:MI'),
+    auth.uid()
+  from public.communities c
+  join public.class_groups cg on c.type='class' and c.ref_id=cg.id
+  where cg.year_group=11 and lower(cg.subject)=lower(trim(p_subject));
+  return e;
+end $$;
+
+create or replace function public.student_portal_snapshot(p_code text)
+returns jsonb language plpgsql security definer set search_path=public as $$
+declare s record; result jsonb;
+begin
+  select st.*,tg.code tutor_code,h.name house_name into s
+  from public.students st
+  left join public.tutor_groups tg on tg.id=st.tutor_group_id
+  left join public.houses h on h.id=st.house_id
+  where st.portal_code_hash=encode(digest(trim(p_code),'sha256'),'hex')
+  and st.status='active'
+  limit 1;
+  if s.id is null then return jsonb_build_object('error','Invalid student access code'); end if;
+
+  select jsonb_build_object(
+    'student',jsonb_build_object(
+      'id',s.id,'first_name',s.first_name,'last_name',s.last_name,'year_group',s.year_group,
+      'candidate_number',s.candidate_number,'tutor_code',s.tutor_code,'house_name',s.house_name
+    ),
+    'classes',coalesce((
+      select jsonb_agg(jsonb_build_object('id',cg.id,'display_name',cg.display_name,'subject',cg.subject,'room_code',cg.room_code) order by cg.subject)
+      from public.class_memberships cm join public.class_groups cg on cg.id=cm.class_group_id
+      where cm.student_id=s.id
+    ),'[]'::jsonb),
+    'timetable',coalesce((
+      select jsonb_agg(to_jsonb(tt) order by tt.day_of_week,tt.period)
+      from public.student_timetable tt where tt.student_id=s.id
+    ),'[]'::jsonb),
+    'notices',coalesce((
+      select jsonb_agg(jsonb_build_object('title',cp.title,'body',cp.body,'created_at',cp.created_at) order by cp.created_at desc)
+      from public.community_posts cp
+      join public.communities c on c.id=cp.community_id
+      where (c.type='tutor' and c.ref_id=s.tutor_group_id)
+         or (c.type='class' and c.ref_id in (select class_group_id from public.class_memberships where student_id=s.id))
+    ),'[]'::jsonb),
+    'exams',coalesce((
+      select jsonb_agg(jsonb_build_object('id',e.id,'exam_type',e.exam_type,'subject',e.subject,'paper',e.paper,'exam_date',e.exam_date,'start_time',e.start_time,'duration_minutes',e.duration_minutes) order by e.exam_date,e.start_time)
+      from public.exams e
+      join public.exam_class_links ecl on ecl.exam_id=e.id
+      where ecl.class_id in (select class_group_id from public.class_memberships where student_id=s.id)
+      and e.exam_date>=current_date
+    ),'[]'::jsonb)
+  ) into result;
+  return result;
+end $$;
+
+-- ---------- Row Level Security ----------
+alter table public.profiles enable row level security;
+alter table public.school_settings enable row level security;
+alter table public.houses enable row level security;
+alter table public.tutor_groups enable row level security;
+alter table public.subjects enable row level security;
+alter table public.rooms enable row level security;
+alter table public.students enable row level security;
+alter table public.class_groups enable row level security;
+alter table public.class_memberships enable row level security;
+alter table public.student_timetable enable row level security;
+alter table public.attendance_marks enable row level security;
+alter table public.behaviour_reasons enable row level security;
+alter table public.behaviour_events enable row level security;
+alter table public.lesson_restrictions enable row level security;
+alter table public.house_points enable row level security;
+alter table public.communities enable row level security;
+alter table public.community_posts enable row level security;
+alter table public.emergency_alerts enable row level security;
+alter table public.exam_windows enable row level security;
+alter table public.exams enable row level security;
+alter table public.exam_class_links enable row level security;
+alter table public.cover_arrangements enable row level security;
+alter table public.calendar_events enable row level security;
+
+-- Staff can read operational MIS data.
+do $$
+declare t text;
+begin
+  foreach t in array array[
+    'school_settings','houses','tutor_groups','subjects','rooms','students','class_groups','class_memberships',
+    'student_timetable','attendance_marks','behaviour_reasons','behaviour_events','lesson_restrictions',
+    'house_points','communities','community_posts','emergency_alerts','exam_windows','exams','exam_class_links',
+    'cover_arrangements','calendar_events'
+  ]
+  loop
+    execute format('drop policy if exists staff_read on public.%I',t);
+    execute format('create policy staff_read on public.%I for select to authenticated using (public.is_staff())',t);
+  end loop;
+end $$;
+
+drop policy if exists own_profile on public.profiles;
+create policy own_profile on public.profiles for select to authenticated using(id=auth.uid());
+
+-- General staff write areas.
+do $$
+declare t text;
+begin
+  foreach t in array array[
+    'tutor_groups','students','class_groups','class_memberships','student_timetable','attendance_marks',
+    'behaviour_events','lesson_restrictions','house_points','communities','community_posts',
+    'emergency_alerts','cover_arrangements','calendar_events'
+  ]
+  loop
+    execute format('drop policy if exists staff_insert on public.%I',t);
+    execute format('drop policy if exists staff_update on public.%I',t);
+    execute format('drop policy if exists staff_delete on public.%I',t);
+    execute format('create policy staff_insert on public.%I for insert to authenticated with check (public.is_staff())',t);
+    execute format('create policy staff_update on public.%I for update to authenticated using (public.is_staff()) with check (public.is_staff())',t);
+    execute format('create policy staff_delete on public.%I for delete to authenticated using (public.is_staff())',t);
+  end loop;
+end $$;
+
+-- Admin / exam staff configuration.
+drop policy if exists admin_settings_update on public.school_settings;
+create policy admin_settings_update on public.school_settings for update to authenticated using(public.is_admin()) with check(public.is_admin());
+
+do $$
+declare t text;
+begin
+  foreach t in array array['houses','subjects','rooms','behaviour_reasons']
+  loop
+    execute format('drop policy if exists admin_insert on public.%I',t);
+    execute format('drop policy if exists admin_update on public.%I',t);
+    execute format('drop policy if exists admin_delete on public.%I',t);
+    execute format('create policy admin_insert on public.%I for insert to authenticated with check (public.is_admin())',t);
+    execute format('create policy admin_update on public.%I for update to authenticated using (public.is_admin()) with check (public.is_admin())',t);
+    execute format('create policy admin_delete on public.%I for delete to authenticated using (public.is_admin())',t);
+  end loop;
+end $$;
+
+drop policy if exists exam_insert on public.exam_windows;
+create policy exam_insert on public.exam_windows for insert to authenticated with check(public.staff_role() in ('admin','exam_officer'));
+drop policy if exists exam_update on public.exam_windows;
+create policy exam_update on public.exam_windows for update to authenticated using(public.staff_role() in ('admin','exam_officer')) with check(public.staff_role() in ('admin','exam_officer'));
+drop policy if exists exam_delete on public.exam_windows;
+create policy exam_delete on public.exam_windows for delete to authenticated using(public.staff_role() in ('admin','exam_officer'));
+
+drop policy if exists exams_insert on public.exams;
+create policy exams_insert on public.exams for insert to authenticated with check(public.staff_role() in ('admin','exam_officer'));
+drop policy if exists exams_update on public.exams;
+create policy exams_update on public.exams for update to authenticated using(public.staff_role() in ('admin','exam_officer')) with check(public.staff_role() in ('admin','exam_officer'));
+drop policy if exists exams_delete on public.exams;
+create policy exams_delete on public.exams for delete to authenticated using(public.staff_role() in ('admin','exam_officer'));
+
+drop policy if exists ecl_insert on public.exam_class_links;
+create policy ecl_insert on public.exam_class_links for insert to authenticated with check(public.staff_role() in ('admin','exam_officer'));
+drop policy if exists ecl_delete on public.exam_class_links;
+create policy ecl_delete on public.exam_class_links for delete to authenticated using(public.staff_role() in ('admin','exam_officer'));
+
+-- Anonymous users receive no direct table access.
+-- Student/parent portal data is available only through the code-validated security-definer snapshot RPC.
+
+-- RPC execution grants.
+grant execute on function public.import_student(text,text,int,uuid) to authenticated;
+grant execute on function public.get_class_register(uuid,date,int) to authenticated;
+grant execute on function public.record_attendance_mark(uuid,uuid,date,int,text,text,text) to authenticated;
+grant execute on function public.record_behaviour(uuid,uuid,int,text,boolean) to authenticated;
+grant execute on function public.set_school_status(text) to authenticated;
+grant execute on function public.create_class_batch(int,int,text,text) to authenticated;
+grant execute on function public.create_exam_window_and_schedule(date,date,text,int) to authenticated;
+grant execute on function public.import_official_gcse_exam(text,text,date,time,int,text) to authenticated;
+grant execute on function public.student_portal_snapshot(text) to anon,authenticated;
+
+-- Protect internal helper functions from anonymous calls.
+revoke execute on function public.generate_student_timetable(uuid) from public,anon;
+revoke execute on function public.make_candidate_number() from public,anon;
+revoke execute on function public.make_portal_code() from public,anon;
+
+
+-- Backfill the configured administrator if the Auth user already existed before this SQL was installed.
+insert into public.profiles(id,email,full_name,role)
+select id,email,'Mason Sanders','admin'
+from auth.users
+where lower(email)='masonsandersbussiness@gmail.com'
+on conflict(id) do update set email=excluded.email, role='admin';
+
+
+-- ================= OneEducation v3 schema =================
+-- OneEducation MIS v3 in-place upgrade
+-- SAFE FOR AN EXISTING INSTALL: this script does NOT delete students, behaviour,
+-- attendance, houses, communities or exam records.
+-- It upgrades timetabling, staff, emergencies, exams and calendar support.
+
+create extension if not exists pgcrypto with schema extensions;
+
+-- -----------------------------------------------------------------------------
+-- Roles / permissions
+-- -----------------------------------------------------------------------------
+alter table public.profiles drop constraint if exists profiles_role_check;
+alter table public.profiles
+  add constraint profiles_role_check
+  check (role in ('admin','slt','teacher','exam_officer','pastoral','cover_manager'));
+
+create or replace function public.is_admin_or_slt()
+returns boolean language sql stable security definer set search_path=public as $$
+  select exists(
+    select 1 from public.profiles
+    where id=auth.uid() and role in ('admin','slt')
+  )
+$$;
+
+-- -----------------------------------------------------------------------------
+-- Staff directory + aligned lesson/duty schedules
+-- -----------------------------------------------------------------------------
+create table if not exists public.staff_members (
+  id uuid primary key default gen_random_uuid(),
+  staff_code text unique not null,
+  full_name text not null,
+  job_title text not null default 'Teacher',
+  role_type text not null default 'Teacher' check(role_type in ('Headteacher','SLT','Teacher','Support')),
+  subject text,
+  allocation_order int not null default 1,
+  slt boolean not null default false,
+  on_call_eligible boolean not null default true,
+  email text,
+  active boolean not null default true,
+  created_at timestamptz not null default now()
+);
+
+alter table public.class_groups add column if not exists teacher_id uuid references public.staff_members(id) on delete set null;
+
+create table if not exists public.class_schedule (
+  id uuid primary key default gen_random_uuid(),
+  class_id uuid not null references public.class_groups(id) on delete cascade,
+  week_pattern text not null check(week_pattern in ('A','B')),
+  day_of_week int not null check(day_of_week between 1 and 5),
+  period int not null check(period between 1 and 5),
+  lesson_label text not null,
+  room_code text,
+  created_at timestamptz not null default now(),
+  unique(class_id,week_pattern,day_of_week,period)
+);
+
+create table if not exists public.staff_duties (
+  id uuid primary key default gen_random_uuid(),
+  staff_id uuid not null references public.staff_members(id) on delete cascade,
+  week_pattern text not null check(week_pattern in ('A','B')),
+  day_of_week int not null check(day_of_week between 1 and 5),
+  period int not null check(period between 1 and 5),
+  duty_type text not null check(duty_type in ('On-Call','SLT Removal','Duty','PPA','Pastoral')),
+  location text,
+  notes text,
+  created_at timestamptz not null default now(),
+  unique(staff_id,week_pattern,day_of_week,period,duty_type)
+);
+
+-- Public page supplied by the project owner currently names Mr Williams as Headteacher.
+-- All other names below are fictional OneEducation demonstration staff.
+insert into public.staff_members(staff_code,full_name,job_title,role_type,subject,allocation_order,slt,on_call_eligible,email) values
+('HT01','Mr Williams','Headteacher','Headteacher',null,1,true,true,null),
+('SLT01','Ms Priya Shah','Deputy Headteacher','SLT',null,1,true,true,null),
+('SLT02','Mr Daniel Mercer','Assistant Headteacher','SLT',null,2,true,true,null),
+('SLT03','Mrs Louise Bennett','Assistant Headteacher','SLT',null,3,true,true,null),
+('ENG01','Mrs Evelyn Foster','Teacher of English','Teacher','English',1,false,true,null),
+('ENG02','Mr Aaron Hughes','Teacher of English','Teacher','English',2,false,true,null),
+('ENG03','Ms Mia Clarke','Teacher of English','Teacher','English',3,false,true,null),
+('ENG04','Mr Nathan Reed','Teacher of English','Teacher','English',4,false,true,null),
+('ENG05','Miss Chloe Barrett','Teacher of English','Teacher','English',5,false,true,null),
+('MAT01','Mr Theo Grant','Teacher of Mathematics','Teacher','Mathematics',1,false,true,null),
+('MAT02','Ms Hannah Cole','Teacher of Mathematics','Teacher','Mathematics',2,false,true,null),
+('MAT03','Mr Adam Turner','Teacher of Mathematics','Teacher','Mathematics',3,false,true,null),
+('MAT04','Mrs Priya Mills','Teacher of Mathematics','Teacher','Mathematics',4,false,true,null),
+('MAT05','Mr Oliver Ward','Teacher of Mathematics','Teacher','Mathematics',5,false,true,null),
+('SCI01','Dr Leah Morgan','Teacher of Science','Teacher','Combined Science',1,false,true,null),
+('SCI02','Mr Samuel King','Teacher of Science','Teacher','Combined Science',2,false,true,null),
+('SCI03','Ms Grace Patel','Teacher of Science','Teacher','Combined Science',3,false,true,null),
+('SCI04','Mr Isaac Bell','Teacher of Science','Teacher','Combined Science',4,false,true,null),
+('SCI05','Ms Ruby Collins','Teacher of Science','Teacher','Combined Science',5,false,true,null),
+('BIO01','Dr Nina Hall','Teacher of Biology','Teacher','Biology',1,false,true,null),
+('CHE01','Dr Ben Carter','Teacher of Chemistry','Teacher','Chemistry',1,false,true,null),
+('PHY01','Dr Eva Shaw','Teacher of Physics','Teacher','Physics',1,false,true,null),
+('HIS01','Mr Lewis Parker','Teacher of History','Teacher','History',1,false,true,null),
+('HIS02','Ms Sophie Harris','Teacher of History','Teacher','History',2,false,true,null),
+('GEO01','Ms Amelia Wood','Teacher of Geography','Teacher','Geography',1,false,true,null),
+('GEO02','Mr Jack Evans','Teacher of Geography','Teacher','Geography',2,false,true,null),
+('FRE01','Ms Camille Martin','Teacher of French','Teacher','French',1,false,true,null),
+('GER01','Ms Freya Weber','Teacher of German','Teacher','German',1,false,true,null),
+('SPA01','Ms Sofia Lewis','Teacher of Spanish','Teacher','Spanish',1,false,true,null),
+('COM01','Mr Daniel Brooks','Teacher of Computer Science','Teacher','Computer Science',1,false,true,null),
+('BUS01','Mrs Rachel Morgan','Teacher of Business','Teacher','Business',1,false,true,null),
+('FIL01','Mr Jamie Sinclair','Teacher of Film Studies','Teacher','Film Studies',1,false,true,null),
+('ART01','Ms Maya Bennett','Teacher of Art & Design','Teacher','Art & Design',1,false,true,null),
+('3DD01','Mr Callum Price','Teacher of 3D Design','Teacher','3D Design',1,false,true,null),
+('PE001','Mr Jordan Ellis','Teacher of PE','Teacher','GCSE PE',1,false,true,null),
+('FOD01','Mrs Sarah Cook','Teacher of Food Preparation','Teacher','Food Preparation & Nutrition',1,false,true,null),
+('MUS01','Mr Tom Bailey','Teacher of Music','Teacher','Music',1,false,true,null),
+('DRA01','Ms Emily Ross','Teacher of Drama','Teacher','Drama',1,false,true,null),
+('RS001','Ms Aisha Khan','Teacher of Religious Studies','Teacher','Religious Studies',1,false,true,null),
+('DT001','Mr Henry Clarke','Teacher of Design & Technology','Teacher','Design & Technology',1,false,true,null),
+('CD001','Mrs Laura Mitchell','Teacher of Child Development','Teacher','Child Development',1,false,true,null)
+on conflict(staff_code) do update set
+  full_name=excluded.full_name,
+  job_title=excluded.job_title,
+  role_type=excluded.role_type,
+  subject=excluded.subject,
+  allocation_order=excluded.allocation_order,
+  slt=excluded.slt,
+  on_call_eligible=excluded.on_call_eligible,
+  active=true;
+
+-- SLT on-call / removal rota examples.
+insert into public.staff_duties(staff_id,week_pattern,day_of_week,period,duty_type,location,notes)
+select id,'A',1,3,'On-Call','Whole site','SLT on-call response' from public.staff_members where staff_code='HT01'
+on conflict do nothing;
+insert into public.staff_duties(staff_id,week_pattern,day_of_week,period,duty_type,location,notes)
+select id,'A',2,4,'SLT Removal','Removal room','Available for behaviour removals' from public.staff_members where staff_code='SLT01'
+on conflict do nothing;
+insert into public.staff_duties(staff_id,week_pattern,day_of_week,period,duty_type,location,notes)
+select id,'B',3,2,'On-Call','Whole site','SLT on-call response' from public.staff_members where staff_code='SLT02'
+on conflict do nothing;
+insert into public.staff_duties(staff_id,week_pattern,day_of_week,period,duty_type,location,notes)
+select id,'B',5,4,'SLT Removal','Removal room','Available for behaviour removals' from public.staff_members where staff_code='SLT03'
+on conflict do nothing;
+
+-- -----------------------------------------------------------------------------
+-- Student profile / portal credential support
+-- Existing secure codes remain valid. Their plaintext cannot be reconstructed from
+-- the hash, so portal_code_display remains null until an admin/SLT resets the code.
+-- New imports store the generated code so authorised staff can see it in profile.
+-- -----------------------------------------------------------------------------
+alter table public.students add column if not exists portal_code_display text;
+
+-- Week A / B timetables. Preserve all existing timetable rows as Week A first.
+alter table public.student_timetable add column if not exists week_pattern text not null default 'A';
+alter table public.student_timetable drop constraint if exists student_timetable_student_id_day_of_week_period_key;
+do $$
+begin
+  if not exists(
+    select 1 from pg_constraint
+    where conname='student_timetable_student_week_day_period_key'
+      and conrelid='public.student_timetable'::regclass
+  ) then
+    alter table public.student_timetable
+      add constraint student_timetable_student_week_day_period_key
+      unique(student_id,week_pattern,day_of_week,period);
+  end if;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- Emergency lifecycle
+-- -----------------------------------------------------------------------------
+alter table public.emergency_alerts drop constraint if exists emergency_alerts_status_check;
+alter table public.emergency_alerts
+  add constraint emergency_alerts_status_check
+  check(status in ('open','monitoring','resolved','cancelled'));
+alter table public.emergency_alerts add column if not exists resolution_note text;
+alter table public.emergency_alerts add column if not exists resolved_by uuid references auth.users(id);
+
+-- -----------------------------------------------------------------------------
+-- Exam lifecycle / student-facing tags
+-- -----------------------------------------------------------------------------
+alter table public.exams add column if not exists status text not null default 'scheduled';
+alter table public.exams drop constraint if exists exams_status_check;
+alter table public.exams
+  add constraint exams_status_check
+  check(status in ('scheduled','delayed','cancelled','deleted'));
+alter table public.exams add column if not exists status_note text;
+alter table public.exams add column if not exists original_exam_date date;
+
+-- -----------------------------------------------------------------------------
+-- Helpers
+-- -----------------------------------------------------------------------------
+create or replace function public.make_portal_code()
+returns text language sql volatile set search_path=public,extensions as $$
+  select 'OE-' || upper(substr(encode(gen_random_bytes(6),'hex'),1,4)) || '-' ||
+         upper(substr(encode(gen_random_bytes(6),'hex'),1,4))
+$$;
+
+create or replace function public.assign_teachers_to_classes()
+returns int language plpgsql security definer set search_path=public as $$
+declare c record; t record; changed int:=0;
+begin
+  if public.is_staff() and not public.is_admin_or_slt() then raise exception 'Administrator or SLT access required'; end if;
+  for c in select * from public.class_groups order by year_group,subject,set_number loop
+    select sm.id,sm.full_name into t
+    from public.staff_members sm
+    where sm.active=true and lower(coalesce(sm.subject,''))=lower(coalesce(c.subject,''))
+    order by abs(sm.allocation_order-c.set_number),sm.allocation_order,sm.full_name
+    limit 1;
+    if t.id is not null then
+      update public.class_groups
+      set teacher_id=t.id,teacher_name=t.full_name
+      where id=c.id;
+      changed:=changed+1;
+    end if;
+  end loop;
+  return changed;
+end $$;
+
+create or replace function public.rebuild_class_schedule()
+returns int language plpgsql security definer set search_path=public as $$
+declare c record; base int; idx int; d int; p int; made int:=0; w text; slots_a int[]; slots_b int[];
+begin
+  if public.is_staff() and not public.is_admin_or_slt() then
+    raise exception 'Administrator or SLT access required';
+  end if;
+
+  delete from public.class_schedule;
+
+  -- English: exactly 2 Language + 2 Literature lessons each week.
+  insert into public.class_schedule(class_id,week_pattern,day_of_week,period,lesson_label,room_code)
+  select id,'A',1,1,'English Language',room_code from public.class_groups where lower(subject)='english'
+  union all select id,'A',2,2,'English Literature',room_code from public.class_groups where lower(subject)='english'
+  union all select id,'A',4,3,'English Language',room_code from public.class_groups where lower(subject)='english'
+  union all select id,'A',5,4,'English Literature',room_code from public.class_groups where lower(subject)='english'
+  union all select id,'B',1,3,'English Language',room_code from public.class_groups where lower(subject)='english'
+  union all select id,'B',2,4,'English Literature',room_code from public.class_groups where lower(subject)='english'
+  union all select id,'B',3,2,'English Language',room_code from public.class_groups where lower(subject)='english'
+  union all select id,'B',5,1,'English Literature',room_code from public.class_groups where lower(subject)='english';
+
+  -- Mathematics: exactly 4 lessons each week. Every set shares its set timetable.
+  insert into public.class_schedule(class_id,week_pattern,day_of_week,period,lesson_label,room_code)
+  select id,'A',1,2,'Mathematics',room_code from public.class_groups where lower(subject)='mathematics'
+  union all select id,'A',2,3,'Mathematics',room_code from public.class_groups where lower(subject)='mathematics'
+  union all select id,'A',4,4,'Mathematics',room_code from public.class_groups where lower(subject)='mathematics'
+  union all select id,'A',5,1,'Mathematics',room_code from public.class_groups where lower(subject)='mathematics'
+  union all select id,'B',1,1,'Mathematics',room_code from public.class_groups where lower(subject)='mathematics'
+  union all select id,'B',2,2,'Mathematics',room_code from public.class_groups where lower(subject)='mathematics'
+  union all select id,'B',4,3,'Mathematics',room_code from public.class_groups where lower(subject)='mathematics'
+  union all select id,'B',5,4,'Mathematics',room_code from public.class_groups where lower(subject)='mathematics';
+
+  -- Combined Science core: 4 lessons each week.
+  insert into public.class_schedule(class_id,week_pattern,day_of_week,period,lesson_label,room_code)
+  select id,'A',1,3,'Combined Science',room_code from public.class_groups where lower(subject)='combined science'
+  union all select id,'A',3,1,'Combined Science',room_code from public.class_groups where lower(subject)='combined science'
+  union all select id,'A',3,4,'Combined Science',room_code from public.class_groups where lower(subject)='combined science'
+  union all select id,'A',5,2,'Combined Science',room_code from public.class_groups where lower(subject)='combined science'
+  union all select id,'B',1,4,'Combined Science',room_code from public.class_groups where lower(subject)='combined science'
+  union all select id,'B',3,1,'Combined Science',room_code from public.class_groups where lower(subject)='combined science'
+  union all select id,'B',4,2,'Combined Science',room_code from public.class_groups where lower(subject)='combined science'
+  union all select id,'B',5,3,'Combined Science',room_code from public.class_groups where lower(subject)='combined science';
+
+  -- Remaining subject classes receive three scheduled lessons per week using the
+  -- non-core timetable slots. These are deterministic per class, so teacher and
+  -- student views line up with one another.
+  slots_a := array[[1,4],[1,5],[2,1],[2,4],[2,5],[3,2],[3,3],[3,5],[4,1],[4,2],[4,5],[5,3],[5,5]];
+  slots_b := array[[1,2],[1,5],[2,1],[2,3],[2,5],[3,3],[3,4],[3,5],[4,1],[4,4],[4,5],[5,2],[5,5]];
+
+  for c in
+    select * from public.class_groups
+    where lower(subject) not in ('english','mathematics','combined science')
+    order by year_group,subject,set_number
+  loop
+    base := mod(abs(hashtext(c.display_name)),13);
+    foreach w in array array['A','B'] loop
+      for idx in 0..2 loop
+        if w='A' then
+          d := slots_a[mod(base+(idx*4),13)+1][1];
+          p := slots_a[mod(base+(idx*4),13)+1][2];
+        else
+          d := slots_b[mod(base+(idx*5)+2,13)+1][1];
+          p := slots_b[mod(base+(idx*5)+2,13)+1][2];
+        end if;
+        insert into public.class_schedule(class_id,week_pattern,day_of_week,period,lesson_label,room_code)
+        values(c.id,w,d,p,c.subject,c.room_code)
+        on conflict(class_id,week_pattern,day_of_week,period) do nothing;
+      end loop;
+    end loop;
+  end loop;
+
+  select count(*) into made from public.class_schedule;
+  return made;
+end $$;
+
+create or replace function public.generate_student_timetable(p_student_id uuid)
+returns void language plpgsql security definer set search_path=public as $$
+declare r record; w text; d int; p int; v_room text;
+begin
+  delete from public.student_timetable where student_id=p_student_id;
+
+  -- Core first, then GCSE/options. Conflicting option slots never overwrite core.
+  for r in
+    select cs.*,cg.display_name,cg.subject,
+      case when lower(cg.subject)='english' then 1
+           when lower(cg.subject)='mathematics' then 2
+           when lower(cg.subject)='combined science' then 3 else 4 end as priority
+    from public.class_memberships cm
+    join public.class_groups cg on cg.id=cm.class_group_id
+    join public.class_schedule cs on cs.class_id=cg.id
+    where cm.student_id=p_student_id
+    order by priority,cs.week_pattern,cs.day_of_week,cs.period,cg.display_name
+  loop
+    insert into public.student_timetable(
+      student_id,week_pattern,day_of_week,period,class_id,class_name,subject,room_code
+    ) values(
+      p_student_id,r.week_pattern,r.day_of_week,r.period,r.class_id,r.display_name,r.lesson_label,coalesce(r.room_code,'H01')
+    ) on conflict(student_id,week_pattern,day_of_week,period) do nothing;
+  end loop;
+
+  -- Keep a complete 5-period day. Any genuinely free slot is shown as supervised
+  -- Personal Development / Study rather than silently disappearing.
+  foreach w in array array['A','B'] loop
+    for d in 1..5 loop
+      for p in 1..5 loop
+        if not exists(
+          select 1 from public.student_timetable
+          where student_id=p_student_id and week_pattern=w and day_of_week=d and period=p
+        ) then
+          select coalesce(tg.room,'H01') into v_room
+          from public.students s left join public.tutor_groups tg on tg.id=s.tutor_group_id
+          where s.id=p_student_id;
+          insert into public.student_timetable(student_id,week_pattern,day_of_week,period,class_name,subject,room_code)
+          values(p_student_id,w,d,p,null,'Personal Development / Study','Personal Development / Study',coalesce(v_room,'H01'));
+        end if;
+      end loop;
+    end loop;
+  end loop;
+end $$;
+
+create or replace function public.rebuild_all_current_timetables()
+returns int language plpgsql security definer set search_path=public as $$
+declare s record; n int:=0;
+begin
+  if public.is_staff() and not public.is_admin_or_slt() then
+    raise exception 'Administrator or SLT access required';
+  end if;
+  for s in select id from public.students where status='active' loop
+    perform public.generate_student_timetable(s.id);
+    n:=n+1;
+  end loop;
+  return n;
+end $$;
+
+create or replace function public.move_student_class(p_student_id uuid,p_new_class_id uuid)
+returns text language plpgsql security definer set search_path=public as $$
+declare v_subject text; v_year int; v_student_year int; v_name text;
+begin
+  if not public.is_admin_or_slt() then raise exception 'Administrator or SLT access required'; end if;
+  select subject,year_group,display_name into v_subject,v_year,v_name from public.class_groups where id=p_new_class_id;
+  select year_group into v_student_year from public.students where id=p_student_id and status='active';
+  if v_subject is null then raise exception 'Target class not found'; end if;
+  if v_student_year is null then raise exception 'Student not found'; end if;
+  if v_year<>v_student_year then raise exception 'Class must be in the student''s year group'; end if;
+
+  delete from public.class_memberships cm
+  using public.class_groups cg
+  where cm.class_group_id=cg.id and cm.student_id=p_student_id and lower(cg.subject)=lower(v_subject);
+  insert into public.class_memberships(student_id,class_group_id) values(p_student_id,p_new_class_id) on conflict do nothing;
+  perform public.generate_student_timetable(p_student_id);
+  return v_name;
+end $$;
+
+create or replace function public.reset_student_portal_code(p_student_id uuid)
+returns text language plpgsql security definer set search_path=public,extensions as $$
+declare v_code text;
+begin
+  if not public.is_admin_or_slt() then raise exception 'Administrator or SLT access required'; end if;
+  if not exists(select 1 from public.students where id=p_student_id) then raise exception 'Student not found'; end if;
+  loop
+    v_code:=public.make_portal_code();
+    exit when not exists(select 1 from public.students where portal_code_hash=encode(digest(v_code,'sha256'),'hex'));
+  end loop;
+  update public.students
+  set portal_code_hash=encode(digest(v_code,'sha256'),'hex'),portal_code_display=v_code
+  where id=p_student_id;
+  return v_code;
+end $$;
+
+-- Preserve import behaviour while storing the new code for staff profile display.
+create or replace function public.import_student(
+  p_first_name text,
+  p_last_name text,
+  p_year_group int,
+  p_tutor_group_id uuid
+) returns table(
+  student_id uuid,
+  full_name text,
+  portal_code text,
+  candidate_number text,
+  house_name text,
+  tutor_code text
+) language plpgsql security definer set search_path=public,extensions as $$
+declare
+  v_student uuid; v_code text; v_candidate text; v_house uuid; v_house_name text; v_tutor_code text; r record;
+begin
+  if not public.is_staff() then raise exception 'Staff login required'; end if;
+  if p_year_group not between 7 and 11 then raise exception 'Invalid year group'; end if;
+  select code into v_tutor_code from public.tutor_groups where id=p_tutor_group_id and year_group=p_year_group;
+  if v_tutor_code is null then raise exception 'Tutor group does not belong to Year %',p_year_group; end if;
+  select h.id,h.name into v_house,v_house_name from public.houses h order by random() limit 1;
+  if v_house is null then raise exception 'No houses configured'; end if;
+
+  loop
+    v_code:=public.make_portal_code();
+    exit when not exists(select 1 from public.students where portal_code_hash=encode(digest(v_code,'sha256'),'hex'));
+  end loop;
+  v_candidate:=public.make_candidate_number();
+
+  insert into public.students(first_name,last_name,year_group,tutor_group_id,house_id,candidate_number,portal_code_hash,portal_code_display)
+  values(trim(p_first_name),trim(p_last_name),p_year_group,p_tutor_group_id,v_house,v_candidate,encode(digest(v_code,'sha256'),'hex'),v_code)
+  returning id into v_student;
+
+  for r in
+    select distinct on(subject) id from public.class_groups
+    where year_group=p_year_group and subject_type='core'
+    order by subject,random()
+  loop
+    insert into public.class_memberships(student_id,class_group_id) values(v_student,r.id) on conflict do nothing;
+  end loop;
+
+  for r in
+    select id from (
+      select distinct on(subject) id,subject from public.class_groups
+      where year_group=p_year_group and subject_type='gcse'
+      order by subject,random()
+    ) q order by random() limit 4
+  loop
+    insert into public.class_memberships(student_id,class_group_id) values(v_student,r.id) on conflict do nothing;
+  end loop;
+
+  if not exists(select 1 from public.class_schedule limit 1) then
+    perform public.rebuild_class_schedule();
+  end if;
+  perform public.generate_student_timetable(v_student);
+
+  insert into public.communities(type,ref_id,name)
+  values('tutor',p_tutor_group_id,v_tutor_code||' Community') on conflict(type,ref_id) do nothing;
+  insert into public.communities(type,ref_id,name)
+  select 'class',cg.id,cg.display_name from public.class_groups cg
+  join public.class_memberships cm on cm.class_group_id=cg.id where cm.student_id=v_student
+  on conflict(type,ref_id) do nothing;
+
+  return query select v_student,trim(p_first_name)||' '||trim(p_last_name),v_code,v_candidate,v_house_name,v_tutor_code;
+end $$;
+
+create or replace function public.finish_emergency_alert(p_alert_id uuid,p_action text,p_note text default null)
+returns void language plpgsql security definer set search_path=public as $$
+begin
+  if not public.is_staff() then raise exception 'Staff login required'; end if;
+  if p_action not in ('resolved','cancelled') then raise exception 'Action must be resolved or cancelled'; end if;
+  update public.emergency_alerts
+  set status=p_action,resolved_at=now(),resolved_by=auth.uid(),resolution_note=nullif(trim(coalesce(p_note,'')),'')
+  where id=p_alert_id and status in ('open','monitoring');
+  if not found then raise exception 'Alert is already closed or was not found'; end if;
+end $$;
+
+create or replace function public.set_exam_status(p_exam_id uuid,p_status text,p_new_date date default null,p_note text default null)
+returns void language plpgsql security definer set search_path=public as $$
+declare e record;
+begin
+  if public.staff_role() not in ('admin','exam_officer') then raise exception 'Admin or Exam Officer access required'; end if;
+  if p_status not in ('scheduled','delayed','cancelled','deleted') then raise exception 'Invalid exam status'; end if;
+  select * into e from public.exams where id=p_exam_id;
+  if e.id is null then raise exception 'Exam not found'; end if;
+  if p_status='delayed' and p_new_date is null then raise exception 'A new date is required for a delayed exam'; end if;
+
+  update public.exams set
+    original_exam_date=case when p_status='delayed' then coalesce(original_exam_date,exam_date) else original_exam_date end,
+    exam_date=case when p_status='delayed' then p_new_date else exam_date end,
+    status=p_status,
+    status_note=nullif(trim(coalesce(p_note,'')),'')
+  where id=p_exam_id;
+
+  if p_status in ('delayed','cancelled') then
+    insert into public.community_posts(community_id,title,body,created_by)
+    select distinct c.id,
+      case when p_status='delayed' then 'Exam delayed' else 'Exam cancelled' end,
+      e.paper||' · '||case when p_status='delayed' then 'New date: '||to_char(p_new_date,'Dy DD Mon YYYY') else 'This exam has been cancelled.' end ||
+      case when nullif(trim(coalesce(p_note,'')),'') is not null then ' · '||trim(p_note) else '' end,
+      auth.uid()
+    from public.exam_class_links ecl
+    join public.communities c on c.type='class' and c.ref_id=ecl.class_id
+    where ecl.exam_id=p_exam_id;
+  end if;
+end $$;
+
+-- Student portal: cancelled/delayed tags are visible; deleted exams are hidden.
+create or replace function public.student_portal_snapshot(p_code text)
+returns jsonb language plpgsql security definer set search_path=public,extensions as $$
+declare s record; result jsonb;
+begin
+  select st.*,tg.code tutor_code,h.name house_name into s
+  from public.students st
+  left join public.tutor_groups tg on tg.id=st.tutor_group_id
+  left join public.houses h on h.id=st.house_id
+  where st.portal_code_hash=encode(digest(trim(p_code),'sha256'),'hex') and st.status='active'
+  limit 1;
+  if s.id is null then return jsonb_build_object('error','Invalid student access code'); end if;
+
+  select jsonb_build_object(
+    'student',jsonb_build_object(
+      'id',s.id,'first_name',s.first_name,'last_name',s.last_name,'year_group',s.year_group,
+      'candidate_number',s.candidate_number,'tutor_code',s.tutor_code,'house_name',s.house_name
+    ),
+    'classes',coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id',cg.id,'display_name',cg.display_name,'subject',cg.subject,'room_code',cg.room_code,'teacher_name',cg.teacher_name
+      ) order by cg.subject)
+      from public.class_memberships cm join public.class_groups cg on cg.id=cm.class_group_id
+      where cm.student_id=s.id
+    ),'[]'::jsonb),
+    'timetable',coalesce((
+      select jsonb_agg(to_jsonb(tt) order by tt.week_pattern,tt.day_of_week,tt.period)
+      from public.student_timetable tt where tt.student_id=s.id
+    ),'[]'::jsonb),
+    'notices',coalesce((
+      select jsonb_agg(jsonb_build_object('title',cp.title,'body',cp.body,'created_at',cp.created_at) order by cp.created_at desc)
+      from public.community_posts cp join public.communities c on c.id=cp.community_id
+      where (c.type='tutor' and c.ref_id=s.tutor_group_id)
+         or (c.type='class' and c.ref_id in (select class_group_id from public.class_memberships where student_id=s.id))
+    ),'[]'::jsonb),
+    'exams',coalesce((
+      select jsonb_agg(jsonb_build_object(
+        'id',e.id,'exam_type',e.exam_type,'subject',e.subject,'paper',e.paper,'exam_date',e.exam_date,
+        'start_time',e.start_time,'duration_minutes',e.duration_minutes,'status',e.status,'status_note',e.status_note
+      ) order by e.exam_date,e.start_time)
+      from public.exams e join public.exam_class_links ecl on ecl.exam_id=e.id
+      where ecl.class_id in (select class_group_id from public.class_memberships where student_id=s.id)
+        and e.status<>'deleted' and (e.exam_date>=current_date or e.status='cancelled')
+    ),'[]'::jsonb)
+  ) into result;
+  return result;
+end $$;
+
+-- -----------------------------------------------------------------------------
+-- RLS for new data
+-- -----------------------------------------------------------------------------
+alter table public.staff_members enable row level security;
+alter table public.class_schedule enable row level security;
+alter table public.staff_duties enable row level security;
+
+drop policy if exists staff_read on public.staff_members;
+create policy staff_read on public.staff_members for select to authenticated using(public.is_staff());
+drop policy if exists staff_read on public.class_schedule;
+create policy staff_read on public.class_schedule for select to authenticated using(public.is_staff());
+drop policy if exists staff_read on public.staff_duties;
+create policy staff_read on public.staff_duties for select to authenticated using(public.is_staff());
+
+drop policy if exists slt_manage on public.staff_members;
+create policy slt_manage on public.staff_members for all to authenticated using(public.is_admin_or_slt()) with check(public.is_admin_or_slt());
+drop policy if exists slt_manage on public.class_schedule;
+create policy slt_manage on public.class_schedule for all to authenticated using(public.is_admin_or_slt()) with check(public.is_admin_or_slt());
+drop policy if exists slt_manage on public.staff_duties;
+create policy slt_manage on public.staff_duties for all to authenticated using(public.is_admin_or_slt()) with check(public.is_admin_or_slt());
+
+grant execute on function public.assign_teachers_to_classes() to authenticated;
+grant execute on function public.rebuild_class_schedule() to authenticated;
+grant execute on function public.rebuild_all_current_timetables() to authenticated;
+grant execute on function public.move_student_class(uuid,uuid) to authenticated;
+grant execute on function public.reset_student_portal_code(uuid) to authenticated;
+grant execute on function public.finish_emergency_alert(uuid,text,text) to authenticated;
+grant execute on function public.set_exam_status(uuid,text,date,text) to authenticated;
+
+-- -----------------------------------------------------------------------------
+-- Apply v3 to EXISTING data. Students themselves are not deleted or recreated.
+-- -----------------------------------------------------------------------------
+select public.assign_teachers_to_classes();
+select public.rebuild_class_schedule();
+select public.rebuild_all_current_timetables();
+
