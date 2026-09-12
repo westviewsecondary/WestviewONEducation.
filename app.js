@@ -172,6 +172,37 @@
     });
   }
 
+
+  // Load the complete timetable in deterministic pages.
+  // Supabase/PostgREST projects commonly cap a single response, so a single
+  // .limit(5000) can silently omit later students (such as newly imported 11MWR).
+  async function fetchAllTimetableRows(){
+    const pageSize = 1000;
+    let from = 0;
+    const rows = [];
+
+    while(true){
+      const {data,error} = await sb
+        .from("student_timetable")
+        .select("*")
+        .order("student_id",{ascending:true})
+        .order("week_pattern",{ascending:true})
+        .order("day_of_week",{ascending:true})
+        .order("period",{ascending:true})
+        .range(from, from + pageSize - 1);
+
+      if(error) throw error;
+
+      const batch = data || [];
+      rows.push(...batch);
+
+      if(batch.length < pageSize) break;
+      from += pageSize;
+    }
+
+    return rows;
+  }
+
   async function loadLive(){
     try{
       const requests = [
@@ -179,12 +210,14 @@
         ["classes","class_groups","*"],["rooms","rooms","*"],["behaviourReasons","behaviour_reasons","*"],["attendance","attendance_marks","*"],["restrictions","lesson_restrictions","*"],
         ["behaviour","behaviour_events","*"],["housePoints","house_points","*"],["examWindows","exam_windows","*"],
         ["exams","exams","*"],["communities","communities","*"],["communityPosts","community_posts","*"],
-        ["emergencies","emergency_alerts","*"],["covers","cover_arrangements","*"],["timetable","student_timetable","*"]
+        ["emergencies","emergency_alerts","*"],["covers","cover_arrangements","*"]
       ];
       for(const [key,table,cols] of requests){
         const {data,error}=await sb.from(table).select(cols).limit(5000);
-        if(error) throw error; state[key]=data||[];
+        if(error) throw error;
+        state[key]=data||[];
       }
+      state.timetable = await fetchAllTimetableRows();
       state.students.forEach(st=>st.class_ids=state.classMemberships.filter(cm=>String(cm.student_id)===String(st.id)).map(cm=>cm.class_group_id));
       const {data:settings,error:se}=await sb.from("school_settings").select("*").eq("id",1).maybeSingle();
       if(se) throw se; state.schoolStatus=settings?.school_status||"open";
@@ -640,9 +673,14 @@
         ["classes","class_groups","*"],["rooms","rooms","*"],["behaviourReasons","behaviour_reasons","*"],["attendance","attendance_marks","*"],["restrictions","lesson_restrictions","*"],
         ["behaviour","behaviour_events","*"],["housePoints","house_points","*"],["examWindows","exam_windows","*"],["exams","exams","*"],
         ["communities","communities","*"],["communityPosts","community_posts","*"],["emergencies","emergency_alerts","*"],["covers","cover_arrangements","*"],
-        ["timetable","student_timetable","*"],["staffMembers","staff_members","*"],["classSchedule","class_schedule","*"],["staffDuties","staff_duties","*"],["calendarEvents","calendar_events","*"]
+        ["staffMembers","staff_members","*"],["classSchedule","class_schedule","*"],["staffDuties","staff_duties","*"],["calendarEvents","calendar_events","*"]
       ];
-      for(const [key,table,cols] of requests){const {data,error}=await sb.from(table).select(cols).limit(5000);if(error)throw error;state[key]=data||[]}
+      for(const [key,table,cols] of requests){
+        const {data,error}=await sb.from(table).select(cols).limit(5000);
+        if(error)throw error;
+        state[key]=data||[];
+      }
+      state.timetable=await fetchAllTimetableRows();
       state.students.forEach(st=>st.class_ids=state.classMemberships.filter(cm=>String(cm.student_id)===String(st.id)).map(cm=>cm.class_group_id));
       const {data:settings,error:se}=await sb.from("school_settings").select("*").eq("id",1).maybeSingle();if(se)throw se;state.schoolStatus=settings?.school_status||"open";
       const {data:{user}}=await sb.auth.getUser();
@@ -670,14 +708,14 @@
   }
   function renderStaffTimetable(staffId,week="A"){
     const target=$("#staffTimetable");if(!target)return;const classIds=new Set(state.classes.filter(c=>String(c.teacher_id)===String(staffId)).map(c=>c.id));
-    const lessons=state.classSchedule.filter(cs=>cs.week_pattern===week&&classIds.has(cs.class_id));const duties=state.staffDuties.filter(d=>String(d.staff_id)===String(staffId)&&d.week_pattern===week);
+    const lessons=state.classSchedule.filter(cs=>cs.week_pattern===week&&(String(cs.teacher_id||"")===String(staffId)||(!cs.teacher_id&&classIds.has(cs.class_id))));const duties=state.staffDuties.filter(d=>String(d.staff_id)===String(staffId)&&d.week_pattern===week);
     let html=`<div class="tt-cell tt-head"></div>`+DAYS.map(d=>`<div class="tt-cell tt-head">${d}</div>`).join("");
     PERIODS.forEach(p=>{html+=`<div class="tt-cell tt-period"><b>P${p.n}</b><span>${p.time}</span></div>`;DAYS.forEach((_,di)=>{const duty=duties.find(x=>+x.day_of_week===di+1&&+x.period===p.n),le=lessons.find(x=>+x.day_of_week===di+1&&+x.period===p.n),c=le?byId(state.classes,le.class_id):null;html+=`<div class="tt-cell">${duty?`<span class="tag red">${esc(duty.duty_type)}</span><b>${esc(duty.location||"On call")}</b>`:le?`<b>${esc(classDisplay(c))}</b><span>${esc(le.lesson_label)} · ${esc(le.room_code||c?.room_code||"")}</span>`:'<span>—</span>'}</div>`})});target.innerHTML=html;
   }
   function renderTimetable(studentId,target="#timetableGrid",week=null){
     week=week||($("#ttWeek")?.value||"A");const entries=state.timetable.filter(t=>String(t.student_id)===String(studentId)&&String(t.week_pattern||"A")===week);let html=`<div class="tt-cell tt-head"></div>`+DAYS.map(d=>`<div class="tt-cell tt-head">${d}</div>`).join("");
     const todayIndex=(new Date(todayISO+"T12:00:00").getDay()+6)%7;
-    PERIODS.forEach(p=>{html+=`<div class="tt-cell tt-period"><b>P${p.n}</b><span>${p.time}</span></div>`;DAYS.forEach((_,di)=>{const e=entries.find(x=>+x.day_of_week===di+1&&+x.period===p.n),restriction=di===todayIndex?state.restrictions.find(r=>String(r.student_id)===String(studentId)&&String(r.restriction_date).slice(0,10)===todayISO&&+r.period===p.n):null,c=e?.class_id?byId(state.classes,e.class_id):null;html+=`<div class="tt-cell">${restriction?`<span class="tag red">${esc(restriction.label||"Scheduled to be out of lesson")}</span>`:""}${e?`<b>${esc(e.subject||e.class_name)}</b><span>${esc(e.room_code||"")}${c?` · ${esc(classDisplay(c))}`:""}</span>${c?`<small>${esc(staffName(c))}</small>`:""}`:'<span>—</span>'}</div>`})});$(target).innerHTML=html;
+    PERIODS.forEach(p=>{html+=`<div class="tt-cell tt-period"><b>P${p.n}</b><span>${p.time}</span></div>`;DAYS.forEach((_,di)=>{const e=entries.find(x=>+x.day_of_week===di+1&&+x.period===p.n),restriction=di===todayIndex?state.restrictions.find(r=>String(r.student_id)===String(studentId)&&String(r.restriction_date).slice(0,10)===todayISO&&+r.period===p.n):null,c=e?.class_id?byId(state.classes,e.class_id):null;html+=`<div class="tt-cell">${restriction?`<span class="tag red">${esc(restriction.label||"Scheduled to be out of lesson")}</span>`:""}${e?`<b>${esc(e.subject||e.class_name)}</b><span>${esc(e.room_code||"")}${c?` · ${esc(classDisplay(c))}`:""}</span>${e?.teacher_name?`<small>${esc(e.teacher_name)}</small>`:(c?`<small>${esc(staffName(c))}</small>`:"")}`:'<span>—</span>'}</div>`})});$(target).innerHTML=html;
   }
   function renderEmergencies(){
     const groups=state.tutorGroups.slice().sort((a,b)=>String(a.code).localeCompare(String(b.code)));const active=e=>!["resolved","cancelled"].includes(e.status);
